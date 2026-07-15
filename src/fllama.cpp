@@ -29,6 +29,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "ggml-backend.h"
@@ -531,6 +532,65 @@ static void run_inference(fllama_inference_request request,
   }
 }
 
+// ── Embedding path (BGE-M3 query encoder for Pasce Oves offline search) ──────
+// Self-contained low-level embedding on its OWN model+context handle — it does
+// NOT touch the server_context generation path above, so the chat model and the
+// embedder never interfere. Mirrors llama.cpp/examples/embedding/embedding.cpp,
+// the same recipe validated at parity against llama-server --embeddings. One
+// handle per model path is cached so repeated query embeds don't reload the
+// ~438 MB GGUF; guarded by a mutex (fllama_embed may be called from a Dart
+// isolate).
+namespace {
+
+struct FllamaEmbedHandle {
+  llama_model *model = nullptr;
+  llama_context *ctx = nullptr;
+  int n_embd = 0;
+};
+
+std::mutex g_embed_mutex;
+std::unordered_map<std::string, FllamaEmbedHandle> g_embed_cache;
+
+// Loads (or returns cached) an embedding handle for [model_path]. Returns
+// nullptr on load failure. Caller holds g_embed_mutex.
+FllamaEmbedHandle *fllama_embed_handle(const char *model_path) {
+  auto it = g_embed_cache.find(model_path);
+  if (it != g_embed_cache.end()) {
+    return &it->second;
+  }
+  fllama_backend_init_once();
+
+  llama_model_params mparams = llama_model_default_params();
+  mparams.n_gpu_layers = 0; // CPU: the embedder is small + latency-tolerant.
+  llama_model *model = llama_model_load_from_file(model_path, mparams);
+  if (model == nullptr) {
+    return nullptr;
+  }
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 512;
+  cparams.n_batch = 512;
+  cparams.n_ubatch = 512;
+  cparams.embeddings = true;
+  // UNSPECIFIED honors the GGUF's own pooling metadata (BGE-M3 = CLS), the
+  // config that passed the desktop parity gate.
+  cparams.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
+  llama_context *ctx = llama_init_from_model(model, cparams);
+  if (ctx == nullptr) {
+    llama_model_free(model);
+    return nullptr;
+  }
+
+  FllamaEmbedHandle h;
+  h.model = model;
+  h.ctx = ctx;
+  h.n_embd = llama_model_n_embd(model);
+  auto res = g_embed_cache.emplace(std::string(model_path), h);
+  return &res.first->second;
+}
+
+} // namespace
+
 // ── FFI entry points ─────────────────────────────────────────────────────────
 
 extern "C" {
@@ -605,6 +665,61 @@ fllama_inference_sync(fllama_inference_request request,
 EMSCRIPTEN_KEEPALIVE FFI_PLUGIN_EXPORT void
 fllama_inference_cancel(int request_id) {
   g_mgr.cancel(request_id);
+}
+
+// Embeds [input] with the GGUF at [model_path], writing [out_len] normalized
+// floats to [out]. Returns 0 on success, negative on error:
+//   -1 bad args, -2 model load failed, -3 dim mismatch (out_len != n_embd),
+//   -4 empty tokenization, -5 decode failed, -6 no sequence embedding.
+// out_len MUST equal the model's embedding dim (1024 for BGE-M3); the Dart
+// side treats any non-zero return as a typed failure and falls back to BM25.
+EMSCRIPTEN_KEEPALIVE FFI_PLUGIN_EXPORT int
+fllama_embed(const char *model_path, const char *input, float *out,
+             int out_len) {
+  if (model_path == nullptr || input == nullptr || out == nullptr ||
+      out_len <= 0) {
+    return -1;
+  }
+  std::lock_guard<std::mutex> lock(g_embed_mutex);
+  FllamaEmbedHandle *h = fllama_embed_handle(model_path);
+  if (h == nullptr) {
+    return -2;
+  }
+  if (h->n_embd != out_len) {
+    return -3;
+  }
+
+  const llama_vocab *vocab = llama_model_get_vocab(h->model);
+  std::vector<llama_token> tokens =
+      common_tokenize(vocab, std::string(input), /*add_special=*/true,
+                      /*parse_special=*/true);
+  if (tokens.empty()) {
+    return -4;
+  }
+  if (static_cast<int>(tokens.size()) > 512) {
+    tokens.resize(512);
+  }
+
+  // Fresh KV each call — every query is independent.
+  llama_memory_clear(llama_get_memory(h->ctx), true);
+  llama_batch batch =
+      llama_batch_init(static_cast<int>(tokens.size()), 0, 1);
+  for (int i = 0; i < static_cast<int>(tokens.size()); i++) {
+    common_batch_add(batch, tokens[i], i, {0}, /*logits=*/true);
+  }
+  if (llama_decode(h->ctx, batch) < 0) {
+    llama_batch_free(batch);
+    return -5;
+  }
+  const float *embd = llama_get_embeddings_seq(h->ctx, 0);
+  if (embd == nullptr) {
+    llama_batch_free(batch);
+    return -6;
+  }
+  // embd_norm = 2 -> L2 normalization, matching the pack + query convention.
+  common_embd_normalize(embd, out, h->n_embd, /*embd_norm=*/2);
+  llama_batch_free(batch);
+  return 0;
 }
 
 } // extern "C"

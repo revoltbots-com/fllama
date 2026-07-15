@@ -76,6 +76,14 @@ EMSCRIPTEN_KEEPALIVE FFI_PLUGIN_EXPORT void fllama_inference_sync(struct fllama_
                            fllama_inference_callback callback);
 EMSCRIPTEN_KEEPALIVE FFI_PLUGIN_EXPORT void fllama_inference_cancel(int request_id);
 
+// Embeds [input] with the GGUF at [model_path] (a text-embedding model such as
+// BGE-M3), writing [out_len] L2-normalized floats to [out]. Returns 0 on
+// success or a negative error code (see fllama.cpp). [out_len] must equal the
+// model's embedding dimension (1024 for BGE-M3). Uses its own model+context
+// handle — independent of the generation path — cached per model path.
+EMSCRIPTEN_KEEPALIVE FFI_PLUGIN_EXPORT int fllama_embed(
+    const char *model_path, const char *input, float *out, int out_len);
+
 // GPU device information.
 // Returns the number of GPU devices visible to ggml/llama.cpp.
 EMSCRIPTEN_KEEPALIVE FFI_PLUGIN_EXPORT int fllama_get_gpu_device_count(void);
