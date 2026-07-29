@@ -404,6 +404,29 @@ static void run_inference(fllama_inference_request request,
       }
     }
 
+    // A caller-supplied GBNF grammar. The struct has carried this field, and
+    // the Dart side has marshalled it across the FFI boundary, since upstream;
+    // nothing ever read it here, so passing one was silently a no-op.
+    //
+    // Placed AFTER the is_oai block deliberately, so an explicit grammar wins
+    // over whatever grammar the chat template derived for tool calls.
+    //
+    // COMMON_GRAMMAR_TYPE_USER is load-bearing rather than cosmetic:
+    // common_grammar_needs_prefill() (common.h:204) is true only for
+    // OUTPUT_FORMAT and TOOL_CALLS, and for those sampling.cpp feeds
+    // generation_prompt tokens into the grammar sampler. A user GBNF's root
+    // rule does not accept an assistant header, so tagging one as TOOL_CALLS
+    // would throw. USER is the tag the --grammar CLI flag uses.
+    if (request.grammar != nullptr && strlen(request.grammar) > 0) {
+      task.params.sampling.grammar =
+          common_grammar(COMMON_GRAMMAR_TYPE_USER, request.grammar);
+      // A user grammar is not lazily triggered. Clear any lazy state the
+      // tool-call path set above, or the sampler pairs this grammar with
+      // trigger patterns that were built for a different one.
+      task.params.sampling.grammar_lazy = false;
+      task.params.sampling.grammar_triggers.clear();
+    }
+
     std::random_device rd;
     task.params.sampling.seed = rd();
 

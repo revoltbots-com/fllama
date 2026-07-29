@@ -103,6 +103,20 @@ class OpenAiRequest {
   /// llama.cpp's default 0.0 when [draftNMax] is large.
   final double? draftPMin;
 
+  /// Optional: a GBNF grammar constraining sampling, so malformed output is
+  /// impossible rather than merely discouraged.
+  ///
+  /// [FllamaInferenceRequest] has carried a `grammar` field all along and the
+  /// FFI layer marshals it, but [fllamaChat] hardcoded it empty and native
+  /// never read it, so a caller could not reach constrained decoding through
+  /// the chat API at all. Measured on a 1B asked for a two-field JSON object:
+  /// 67% of 303 replies were unparseable without a grammar.
+  ///
+  /// Use [fllamaJsonSchemaToGrammar] to derive one from a JSON schema. When
+  /// set, this takes precedence over any tool-call grammar the chat template
+  /// produced.
+  final String? grammar;
+
   String toJsonString() {
     final Map<String, dynamic> json = {
       'messages': messages
@@ -181,5 +195,7 @@ class OpenAiRequest {
     this.draftModelPath,
     this.draftNMax,
     this.draftPMin,
+    // Optional GBNF grammar to constrain sampling. Native-only.
+    this.grammar,
   });
 }

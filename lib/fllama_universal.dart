@@ -149,7 +149,13 @@ Future<int> fllamaChat(
     penaltyRepeat: request.presencePenalty,
     temperature: request.temperature,
     topP: request.topP,
-    grammar: '', // deprecated, llama.cpp handles tools internally now
+    // Was hardcoded empty with the note "deprecated, llama.cpp handles tools
+    // internally now". True for TOOL grammars, which the chat template derives
+    // natively — but it also made a caller-supplied grammar unreachable through
+    // the chat API, so constrained decoding was impossible for anything other
+    // than tool calls. Native now reads this (src/fllama.cpp, after the is_oai
+    // block) and an explicit grammar takes precedence over the tool one.
+    grammar: request.grammar ?? '',
     logger: request.logger,
     eosToken: eosToken,
     openAiRequestJsonString: request.toJsonString(),
